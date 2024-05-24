@@ -857,108 +857,79 @@ public class Server {
         return rankSystem;
     }
 
+    // 初始化整个服务
+    // TODO 这个方法内部太长了, 且揉了一大堆业务逻辑, 典型的反面教材
+    // TODO 服务的启动应该是一个启动队列, 队列中是启动任务项, 业务侧通过将每个阶段实现为taskItem, 来抽象该阶段的功能/优先级, 以及描述前后依赖,
+    // TODO 如果要实现性能优化, 启动队列可以根据taskItem的依赖配置, 实现无依赖部分的并行化加载
+    // TODO 在初期阶段, 用最简单的方式来实现, 可以声明一个只包含run方法的接口, 并在这个入口处做硬编码的依赖配置
+
+    // TODO 第一期先将其拆分成小方法，剥离业务逻辑之间的关系
     public void init() {
+        // 获取当前的时间戳
         Instant beforeInit = Instant.now();
         log.info("Cosmic v{} starting up.", ServerConstants.VERSION);
 
-        if (YamlConfig.config.server.SHUTDOWNHOOK) {
-            Runtime.getRuntime().addShutdownHook(new Thread(shutdown(false)));
-        }
-
-        if (!DatabaseConnection.initializeConnectionPool()) {
-            throw new IllegalStateException("Failed to initiate a connection to the database");
-        }
-
-        channelDependencies = registerChannelDependencies();
-
-        final ExecutorService initExecutor = Executors.newFixedThreadPool(10);
-        // Run slow operations asynchronously to make startup faster
-        final List<Future<?>> futures = new ArrayList<>();
-        futures.add(initExecutor.submit(SkillFactory::loadAllSkills));
-        futures.add(initExecutor.submit(CashItemFactory::loadAllCashItems));
-        futures.add(initExecutor.submit(Quest::loadAllQuests));
-        futures.add(initExecutor.submit(SkillbookInformationProvider::loadAllSkillbookInformation));
-        initExecutor.shutdown();
-
-        TimeZone.setDefault(TimeZone.getTimeZone(YamlConfig.config.server.TIMEZONE));
-
-        final int worldCount = Math.min(GameConstants.WORLD_NAMES.length, YamlConfig.config.server.WORLDS);
-        try (Connection con = DatabaseConnection.getConnection()) {
-            setAllLoggedOut(con);
-            setAllMerchantsInactive(con);
-            cleanNxcodeCoupons(con);
-            loadCouponRates(con);
-            updateActiveCoupons(con);
-            NewYearCardRecord.startPendingNewYearCardRequests(con);
-            CashIdGenerator.loadExistentCashIdsFromDb(con);
-            applyAllNameChanges(con); // -- name changes can be missed by INSTANT_NAME_CHANGE --
-            applyAllWorldTransfers(con);
-            PlayerNPC.loadRunningRankData(con, worldCount);
-        } catch (SQLException sqle) {
-            log.error("Failed to run all startup-bound database tasks", sqle);
-            throw new IllegalStateException(sqle);
-        }
-
-        ThreadManager.getInstance().start();
-        initializeTimelyTasks(channelDependencies);    // aggregated method for timely tasks thanks to lxconan
-
-        try {
-            for (int i = 0; i < worldCount; i++) {
-                initWorld();
-            }
-            initWorldPlayerRanking();
-
-            loadPlayerNpcMapStepFromDb();
-
-            if (YamlConfig.config.server.USE_FAMILY_SYSTEM) {
-                try (Connection con = DatabaseConnection.getConnection()) {
-                    Family.loadAllFamilies(con);
-                }
-            }
-        } catch (Exception e) {
-            log.error("[SEVERE] Syntax error in 'world.ini'.", e); //For those who get errors
-            System.exit(0);
-        }
-
-        // Wait on all async tasks to complete
-        for (Future<?> future : futures) {
-            try {
-                future.get();
-            } catch (Exception e) {
-                log.error("Failed to run all startup-bound loading tasks", e);
-                throw new IllegalStateException(e);
-            }
-        }
-
-        loginServer = initLoginServer(8484);
-
         log.info("Listening on port 8484");
+        // 初始化服务端配置
+        initServerConfig();
 
         online = true;
+        // 初始化数据库连接池
+        initDatabaseConnection();
+
+        // 初始化频道服务中心
+        // TODO 但这个实现放在这里是一种很粗糙的方式, 推测应该是想做成一个服务中心的东西
+        // TODO 这里后续会优化掉, 变更为服务中心的实现(MapleContext.serviceCenter), 这里不再做注册
+        channelDependencies = registerChannelDependencies();
+
+        // 资源的异步加载
+        final List<Future<?>> futures = initResourcesAsyncLoad();
+
+        // 初始化线程池
+        initThreadManager();
+
+        // 初始化全部的大区
+        initTotalWorlds();
+
+        // 等待上面的task完成
+        waitResourcesLoad(futures);
+
+        // 初始化登录服务
+        loginServer = initLoginServer(8484);
+
+        // 统计加载时长
         Duration initDuration = Duration.between(beforeInit, Instant.now());
         log.info("Cosmic is now online after {} ms.", initDuration.toMillis());
 
-        OpcodeConstants.generateOpcodeNames();
-        CommandsExecutor.getInstance();
+        // 执行一些低优先级的任务
+        // TODO 这里的设计应该是通过优先级队列来操作, 直接提交任务并指定优先级
+        postConfig();
 
-        for (Channel ch : this.getAllChannels()) {
-            ch.reloadEventScriptManager();
-        }
+        // 初始化任务事件脚本(低优)
+        initEventScript();
     }
 
     private ChannelDependencies registerChannelDependencies() {
+        // 1.接收一个note数据访问对象, 并创建一个note服务
         NoteService noteService = new NoteService(new NoteDao());
         FredrickProcessor fredrickProcessor = new FredrickProcessor(noteService);
         ChannelDependencies channelDependencies = new ChannelDependencies(noteService, fredrickProcessor);
 
+        // 4.将频道依赖注册到封包处理器中
+        // TODO 目前看整体的意思是channelDependencies作为一个服务中心, 传递给PacketProcessor,
+        // TODO 目前主要用在处理一些需要给用户发送消息提示的地方(例如被家族开除等)
         PacketProcessor.registerGameHandlerDependencies(channelDependencies);
 
         return channelDependencies;
     }
 
     private LoginServer initLoginServer(int port) {
+        log.info("Listening on port {}", port);
+
         LoginServer loginServer = new LoginServer(port);
         loginServer.start();
+
+        online = true;
         return loginServer;
     }
 
@@ -1972,6 +1943,132 @@ public class Server {
             log.info("Restarting the server...");
             instance = null;
             getInstance().init();//DID I DO EVERYTHING?! D:
+        }
+    }
+
+    ////// 拆分代码 //////
+
+    /** 初始化数据库连接 */
+    private void initDatabaseConnection() {
+        // TODO 这个方法的实现不应该在这里, 目前只是做第一期方法拆分, 后续再优化逻辑
+        if (!DatabaseConnection.initializeConnectionPool()) {
+            throw new IllegalStateException("Failed to initiate a connection to the database");
+        }
+    }
+
+    /** 配置文件的处理 */
+    private void initServerConfig() {
+        // 判断配置文件中, 是否开启在服务端关闭时做hook操作
+        if (YamlConfig.config.server.SHUTDOWNHOOK) {
+            Runtime.getRuntime().addShutdownHook(new Thread(shutdown(false)));
+        }
+
+        // 从配置中读取并设置时区
+        TimeZone.setDefault(TimeZone.getTimeZone(YamlConfig.config.server.TIMEZONE));
+    }
+
+    /** 并行加载资源(技能/现金道具/任务/技能书) */
+    private List<Future<?>> initResourcesAsyncLoad() {
+        // TODO 这里不知道能不能延迟, 看起来是些很费时间的io任务
+        // 创建了一个包含10个线程的执行池
+        // TODO 这个10也是一个比较拙计的东西, 应该是读cpu的线程数, 最大化并发性
+        // TODO 这一块的逻辑其实也可以复用启动队列, 逻辑上是递归的
+        // TODO 这一块可以使用CompatibleFuture, 来组合任务的调度
+        final ExecutorService initExecutor = Executors.newFixedThreadPool(10);
+        // Run slow operations asynchronously to make startup faster
+        final List<Future<?>> futures = new ArrayList<>();
+        futures.add(initExecutor.submit(SkillFactory::loadAllSkills));
+        futures.add(initExecutor.submit(CashItemFactory::loadAllCashItems));
+        futures.add(initExecutor.submit(Quest::loadAllQuests));
+        futures.add(initExecutor.submit(SkillbookInformationProvider::loadAllSkillbookInformation));
+        // TODO shutdown指的是executor不再接收新的任务, 并立刻开始执行其内部已经注册的异步任务
+        // TODO 该操作不会阻塞当前线程
+        initExecutor.shutdown();
+
+        return futures;
+    }
+
+    /** 等待(阻塞)异步资源加载完成 */
+    private void waitResourcesLoad(List<Future<?>> futures) {
+        // TODO 上面这一大坨, 也能放进task里吧, 看起来是没什么依赖的
+        // Wait on all async tasks to complete
+        for (Future<?> future : futures) {
+            try {
+                future.get();
+            } catch (Exception e) {
+                log.error("Failed to run all startup-bound loading tasks", e);
+                throw new IllegalStateException(e);
+            }
+        }
+    }
+
+    /** 初始化线程池 */
+    private void initThreadManager() {
+        ThreadManager.getInstance().start();
+        initializeTimelyTasks(channelDependencies);    // aggregated method for timely tasks thanks to lxconan
+    }
+
+    /** 初始化所有游戏大区 */
+    private void initTotalWorlds() {
+        final int worldCount = Math.min(GameConstants.WORLD_NAMES.length, YamlConfig.config.server.WORLDS);
+        try (Connection con = DatabaseConnection.getConnection()) {
+            // 所有账号标记为登出
+            setAllLoggedOut(con);
+            // 所有角色的商店关闭
+            setAllMerchantsInactive(con);
+            // 清除掉所有过期(超过14天)的券(爆率/经验/金币等)
+            cleanNxcodeCoupons(con);
+            // 加载券的倍率
+            loadCouponRates(con);
+            // 加载可以使用的券
+            updateActiveCoupons(con);
+            // 设置一小时后的新年贺卡发送任务
+            NewYearCardRecord.startPendingNewYearCardRequests(con);
+            // 加载一些额外的现金物品(戒指和宠物)
+            CashIdGenerator.loadExistentCashIdsFromDb(con);
+            // 执行还未进行的角色名变更任务
+            applyAllNameChanges(con); // -- name changes can be missed by INSTANT_NAME_CHANGE --
+            // 执行还未进行的角色转区任务
+            applyAllWorldTransfers(con);
+            PlayerNPC.loadRunningRankData(con, worldCount);
+        } catch (SQLException sqle) {
+            log.error("Failed to run all startup-bound database tasks", sqle);
+            throw new IllegalStateException(sqle);
+        }
+
+        try {
+            // 初始化各个区(蓝蜗牛/绿水灵这些的)
+            for (int i = 0; i < worldCount; i++) {
+                initWorld();
+            }
+            // 初始化玩家排名
+            // TODO 目前对我来说没什么卵用
+            initWorldPlayerRanking();
+
+            // TODO 没看懂在干什么
+            loadPlayerNpcMapStepFromDb();
+
+            // 加载家族信息
+            // TODO 没看懂逻辑, 字段太多了... 目前用不上, 先不管
+            if (YamlConfig.config.server.USE_FAMILY_SYSTEM) {
+                try (Connection con = DatabaseConnection.getConnection()) {
+                    Family.loadAllFamilies(con);
+                }
+            }
+        } catch (Exception e) {
+            log.error("[SEVERE] Syntax error in 'world.ini'.", e); //For those who get errors
+            System.exit(0);
+        }
+    }
+
+    private void postConfig() {
+        OpcodeConstants.generateOpcodeNames();
+        CommandsExecutor.getInstance();
+    }
+
+    private void initEventScript() {
+        for (Channel ch : this.getAllChannels()) {
+            ch.reloadEventScriptManager();
         }
     }
 }

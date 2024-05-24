@@ -18,6 +18,7 @@ public class NoteService {
 
     private final NoteDao noteDao;
 
+    // TODO 简单看了一下这块，这个东西目前内部的实现是，给用户发送提示消息(例如家族开除这种)
     public NoteService(NoteDao noteDao) {
         this.noteDao = noteDao;
     }
